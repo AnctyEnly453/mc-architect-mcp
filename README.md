@@ -1,11 +1,11 @@
-# MC Architect
+# MC Architect MCP
 
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11-62B47A)](https://www.minecraft.net/)
 [![Fabric](https://img.shields.io/badge/Fabric-0.18.6%2B-DBD0B4)](https://fabricmc.net/)
 [![MCP](https://img.shields.io/badge/MCP-0.5.0-7C5CFC)](https://modelcontextprotocol.io/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**MC Architect** 是一套面向 AI/MCP 客户端的 Minecraft Java 单人世界建筑系统。它通过本地 Fabric Mod 读取和修改真实世界，再由 TypeScript MCP Bridge 提供地形扫描、蓝图施工、几何生成、路径验证、照明检查、截图验收和持久化撤销等高层工具。
+**MC Architect MCP** 是一套面向 AI/MCP 客户端的 Minecraft Java 单人世界建筑系统。它通过本地 Fabric Mod 读取和修改真实世界，再由 TypeScript MCP Bridge 提供地形扫描、蓝图施工、几何生成、路径验证、照明检查、截图验收和持久化撤销等高层工具。
 
 > English summary: a local Fabric mod and MCP server for inspecting, building, validating, photographing, and undoing changes in Minecraft Java single-player worlds.
 
@@ -106,7 +106,7 @@ npm test
   "mcpServers": {
     "minecraft": {
       "command": "node",
-      "args": ["D:/path/to/mc-architect/bridge/dist/index.js"]
+      "args": ["D:/path/to/mc-architect-mcp/bridge/dist/index.js"]
     }
   }
 }
