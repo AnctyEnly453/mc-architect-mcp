@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+*.log
+
+# Gradle / Minecraft run data
+.gradle/
+build/
+run/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+mcarchitect.json
+.env
+.env.*

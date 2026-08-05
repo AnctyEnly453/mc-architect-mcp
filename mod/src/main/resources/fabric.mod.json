@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "mcarchitect",
+  "version": "${version}",
+  "name": "MC Architect Bridge",
+  "description": "A safe local building bridge for MCP clients.",
+  "authors": ["MC Architect"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": ["dev.mcarchitect.McArchitectMod"],
+    "client": ["dev.mcarchitect.McArchitectClient"]
+  },
+  "mixins": [
+    "mcarchitect.client.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.6",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
