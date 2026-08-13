@@ -2,6 +2,7 @@ package dev.mcarchitect;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.storage.LevelSummary;
 
 import java.nio.file.Files;
@@ -86,7 +87,7 @@ final class ArchitectClientController {
         if (minecraft.level == null) {
             return Map.of("accepted", false, "message", "No world is open");
         }
-        minecraft.execute(minecraft::disconnectWithSavingScreen);
+        minecraft.execute(() -> minecraft.disconnectFromWorld(Component.translatable("menu.savingLevel")));
         return Map.of("accepted", true, "message", "Saving and returning to the title screen");
     }
 
