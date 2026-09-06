@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.mcarchitect.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["LevelTicksAccessor", "RedstoneTicksMixin", "RedstoneWireMixin", "RedstoneLevelMixin", "RedstoneSaveMixin", "RedstoneTorchMixin"],
+  "injectors": {"defaultRequire": 1}
+}

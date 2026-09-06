@@ -1,0 +1,228 @@
+{
+  "format": "mcengineer/workspace/1",
+  "projectId": "signal-bus",
+  "name": "四位信号总线工作台",
+  "worldId": "REPLACE_WITH_WORLD_CONTEXT",
+  "dimension": "minecraft:overworld",
+  "origin": {
+    "x": 0,
+    "y": 64,
+    "z": 0
+  },
+  "statePolicy": "redstone",
+  "stages": [
+    {
+      "id": "support"
+    },
+    {
+      "id": "logic",
+      "dependsOn": [
+        "support"
+      ]
+    },
+    {
+      "id": "controls",
+      "dependsOn": [
+        "logic"
+      ]
+    }
+  ],
+  "templates": {
+    "lane": {
+      "operations": [
+        {
+          "from": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          "to": {
+            "x": 7,
+            "y": 0,
+            "z": 0
+          },
+          "block": "minecraft:smooth_stone",
+          "stage": "support"
+        },
+        {
+          "from": {
+            "x": 1,
+            "y": 1,
+            "z": 0
+          },
+          "to": {
+            "x": 6,
+            "y": 1,
+            "z": 0
+          },
+          "block": "minecraft:redstone_wire[east=side,north=none,power=0,south=none,west=side]",
+          "stage": "logic"
+        },
+        {
+          "from": {
+            "x": 7,
+            "y": 1,
+            "z": 0
+          },
+          "to": {
+            "x": 7,
+            "y": 1,
+            "z": 0
+          },
+          "block": "minecraft:redstone_lamp[lit=false]",
+          "stage": "logic"
+        },
+        {
+          "from": {
+            "x": 0,
+            "y": 1,
+            "z": 0
+          },
+          "to": {
+            "x": 0,
+            "y": 1,
+            "z": 0
+          },
+          "block": "minecraft:lever[face=floor,facing=north,powered=false]",
+          "stage": "controls"
+        }
+      ]
+    }
+  },
+  "modules": [
+    {
+      "id": "bus",
+      "name": "4-bit bus",
+      "kind": "circuit",
+      "ports": [
+        {
+          "id": "data",
+          "kind": "input",
+          "positions": [
+            {
+              "x": 0,
+              "y": 1,
+              "z": 0
+            },
+            {
+              "x": 0,
+              "y": 1,
+              "z": 3
+            },
+            {
+              "x": 0,
+              "y": 1,
+              "z": 6
+            },
+            {
+              "x": 0,
+              "y": 1,
+              "z": 9
+            }
+          ]
+        },
+        {
+          "id": "out",
+          "kind": "output",
+          "sample": "wire",
+          "positions": [
+            {
+              "x": 6,
+              "y": 1,
+              "z": 0
+            },
+            {
+              "x": 6,
+              "y": 1,
+              "z": 3
+            },
+            {
+              "x": 6,
+              "y": 1,
+              "z": 6
+            },
+            {
+              "x": 6,
+              "y": 1,
+              "z": 9
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lane0",
+      "name": "Bit 0",
+      "kind": "signal-lane",
+      "parent": "bus",
+      "template": "lane",
+      "stage": "logic",
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "id": "lane1",
+      "name": "Bit 1",
+      "kind": "signal-lane",
+      "parent": "bus",
+      "template": "lane",
+      "stage": "logic",
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 3
+      }
+    },
+    {
+      "id": "lane2",
+      "name": "Bit 2",
+      "kind": "signal-lane",
+      "parent": "bus",
+      "template": "lane",
+      "stage": "logic",
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 6
+      }
+    },
+    {
+      "id": "lane3",
+      "name": "Bit 3",
+      "kind": "signal-lane",
+      "parent": "bus",
+      "template": "lane",
+      "stage": "logic",
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 9
+      }
+    },
+    {
+      "id": "platform",
+      "name": "工作台底座",
+      "kind": "structure",
+      "stage": "support",
+      "operations": [
+        {
+          "from": {
+            "x": -2,
+            "y": -1,
+            "z": -2
+          },
+          "to": {
+            "x": 10,
+            "y": -1,
+            "z": 11
+          },
+          "block": "minecraft:deepslate_tiles",
+          "stage": "support"
+        }
+      ]
+    }
+  ]
+}

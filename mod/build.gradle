@@ -34,3 +34,19 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+sourceSets {
+    engineTest {
+        compileClasspath += sourceSets.main.output + configurations.testCompileClasspath
+        runtimeClasspath += output + compileClasspath + configurations.testRuntimeClasspath
+    }
+}
+
+tasks.register('engineeringFlowTest', JavaExec) {
+    dependsOn engineTestClasses
+    classpath = sourceSets.engineTest.runtimeClasspath
+    mainClass = 'dev.mcarchitect.EngineeringFlowTest'
+}
+
+tasks.named('check') {
+    dependsOn engineeringFlowTest
+}

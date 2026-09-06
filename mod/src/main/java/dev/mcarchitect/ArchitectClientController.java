@@ -22,10 +22,13 @@ final class ArchitectClientController {
     private static ArchitectClientController instance;
 
     private final Minecraft minecraft;
+    private final MinecraftVideoRecorder video;
+    private boolean creatingLevel;
     private final AtomicReference<ScreenshotRequest> pendingScreenshot = new AtomicReference<>();
 
     private ArchitectClientController(Minecraft minecraft) {
         this.minecraft = minecraft;
+        this.video = new MinecraftVideoRecorder(minecraft);
     }
 
     static void initialize() {
@@ -86,11 +89,42 @@ final class ArchitectClientController {
         if (minecraft.level == null) {
             return Map.of("accepted", false, "message", "No world is open");
         }
-        minecraft.execute(minecraft::disconnectWithSavingScreen);
+        minecraft.execute(() -> minecraft.disconnectFromWorld(net.minecraft.client.multiplayer.ClientLevel.DEFAULT_QUIT_MESSAGE));
         return Map.of("accepted", true, "message", "Saving and returning to the title screen");
     }
 
-    Map<String, Object> captureScreenshot() {
+    Map<String, Object> createFlatWorld(String levelId) {
+        if (levelId == null || !levelId.matches("[A-Za-z0-9_-]{1,80}")) throw new ClientControlException(400, "Use a simple world ID");
+        return onClient(() -> {
+            if (minecraft.level != null || minecraft.hasSingleplayerServer() || creatingLevel) throw new ClientControlException(409, "A world is open or starting");
+            if (Files.exists(minecraft.gameDirectory.toPath().resolve("saves").resolve(levelId))) throw new ClientControlException(409, "World directory already exists");
+            creatingLevel = true;
+            minecraft.execute(() -> {
+                try {
+                    var data = net.minecraft.world.level.WorldDataConfiguration.DEFAULT;
+                    var rules = new net.minecraft.world.level.gamerules.GameRules(data.enabledFeatures());
+                    var settings = new net.minecraft.world.level.LevelSettings(levelId, net.minecraft.world.level.GameType.CREATIVE,
+                            false, net.minecraft.world.Difficulty.PEACEFUL, true, rules, data);
+                    minecraft.options.pauseOnLostFocus = false;
+                    minecraft.options.save();
+                    minecraft.createWorldOpenFlows().createFreshLevel(levelId, settings,
+                            new net.minecraft.world.level.levelgen.WorldOptions(20260906L, false, false),
+                            net.minecraft.world.level.levelgen.presets.WorldPresets::createFlatWorldDimensions, minecraft.screen);
+                } finally { creatingLevel = false; }
+            });
+            return Map.of("accepted", true, "levelId", levelId, "preset", "flat_creative");
+        });
+    }
+
+    Map<String,Object> openKeyboard(boolean demo) {
+        try { return ComputerKeyboardScreen.open(demo,false).get(12,TimeUnit.SECONDS); }
+        catch(Exception error) { throw new ClientControlException(409,"计算机面板无法打开",error); }
+    }
+
+    Map<String,Object> video(com.google.gson.JsonObject request) { return onClient(() -> video.control(request)); }
+    double[] cameraPose() { return video.cameraPose(); }
+
+    Map<String, Object> captureScreenshot(boolean includeUI) {
         String filename = SCREENSHOT_NAME.format(Instant.now()) + ".png";
         Path target = minecraft.gameDirectory.toPath().resolve("screenshots").resolve(filename);
         CompletableFuture<Map<String, Object>> captured = new CompletableFuture<>();
@@ -98,7 +132,7 @@ final class ArchitectClientController {
                 filename,
                 target,
                 minecraft.screen == null ? "in_game" : minecraft.screen.getClass().getSimpleName(),
-                captured
+                captured, includeUI
         );
         if (!pendingScreenshot.compareAndSet(null, request)) {
             throw new ClientControlException(409, "Another clean screenshot is already pending");
@@ -123,7 +157,13 @@ final class ArchitectClientController {
     }
 
     void capturePendingWorldFrame() {
-        ScreenshotRequest request = pendingScreenshot.getAndSet(null);
+        capturePendingFrame(false);
+    }
+    void capturePendingGuiFrame() { capturePendingFrame(true); }
+    private void capturePendingFrame(boolean ui) {
+        video.capture(ui);
+        ScreenshotRequest request = pendingScreenshot.get();
+        if(request==null || request.includeUI!=ui || !pendingScreenshot.compareAndSet(request,null)) return;
         if (request == null) return;
 
         Screenshot.grab(
@@ -135,7 +175,7 @@ final class ArchitectClientController {
                         "path", request.target.toAbsolutePath().toString(),
                         "mediaType", "image/png",
                         "screen", request.screen,
-                        "cleanWorldFrame", true
+                        "cleanWorldFrame", !ui
                 ))
         );
     }
@@ -176,7 +216,7 @@ final class ArchitectClientController {
     }
 
     private record ScreenshotRequest(String filename, Path target, String screen,
-                                     CompletableFuture<Map<String, Object>> result) {}
+                                     CompletableFuture<Map<String, Object>> result, boolean includeUI) {}
 
     static final class ClientControlException extends RuntimeException {
         final int status;

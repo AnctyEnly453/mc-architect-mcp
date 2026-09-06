@@ -2,16 +2,23 @@
   "schemaVersion": 1,
   "id": "mcarchitect",
   "version": "${version}",
-  "name": "MC Architect Bridge",
-  "description": "A safe local building bridge for MCP clients.",
-  "authors": ["MC Architect"],
+  "name": "MC Engineer",
+  "description": "Local Minecraft engineering: modular projects, resumable construction and redstone debugging.",
+  "authors": [
+    "MC Architect"
+  ],
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
-    "main": ["dev.mcarchitect.McArchitectMod"],
-    "client": ["dev.mcarchitect.McArchitectClient"]
+    "main": [
+      "dev.mcarchitect.McArchitectMod"
+    ],
+    "client": [
+      "dev.mcarchitect.McArchitectClient"
+    ]
   },
   "mixins": [
+    "mcarchitect.mixins.json",
     "mcarchitect.client.mixins.json"
   ],
   "depends": {

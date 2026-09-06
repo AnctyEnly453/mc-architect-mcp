@@ -18,6 +18,7 @@ public final class McArchitectMod implements ModInitializer {
         var config = ArchitectConfig.load();
         httpServer = new ArchitectHttpServer(config);
         httpServer.start();
+        RedstoneCommands.register(httpServer);
 
         ServerLifecycleEvents.SERVER_STARTED.register(httpServer::setMinecraftServer);
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> httpServer.setMinecraftServer(null));

@@ -1,0 +1,13 @@
+{
+  "format": "mcarchitect-project/1",
+  "projectId": "cross-language-fixture",
+  "worldId": "test-world",
+  "dimension": "minecraft:overworld",
+  "planId": "b6b23412729fcf3e6811736ae97a019c1618933f3880b6501c8d5bd95908c008",
+  "sectionCount": 2,
+  "requestedBlocks": 3,
+  "hashes": [
+    "d1725c5fee189edba2b0b8a7c2ee399bba67fb5dab4c9d5f600ef130bf8ec06a",
+    "977ef983f90e6be22a4bd86609a70b857b0e458c5efe3163ea4ecd0d969f0ca4"
+  ]
+}

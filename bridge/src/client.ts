@@ -9,20 +9,6 @@ export type FillOperation = { from: Position; to: Position; block: string };
 export type ScreenshotResult = { path: string; mediaType: string; screen: string };
 export type ScanMode = "heightmap" | "summary" | "collision" | "lighting" | "full";
 export type CameraPosition = { x: number; y: number; z: number };
-export type TransformOptions = {
-  from: Position;
-  to: Position;
-  target: Position;
-  rotation?: 0 | 90 | 180 | 270;
-  mirror?: "none" | "x" | "z";
-  copies?: number;
-  spacing?: Position;
-  includeAir?: boolean;
-  label?: string;
-  projectId?: string;
-  dryRun?: boolean;
-};
-
 export class MinecraftClient {
   private constructor(private readonly config: BridgeConfig) {}
 
@@ -63,6 +49,13 @@ export class MinecraftClient {
   openWorld(levelId: string): Promise<unknown> {
     return this.request("POST", "/v1/open-world", { levelId });
   }
+  createWorld(levelId: string): Promise<unknown> { return this.request("POST", "/v1/create-world", { levelId }); }
+
+  setTickRate(rate: number): Promise<unknown> { return this.request("POST", "/v1/tick-rate", { rate }); }
+  saveWorld(): Promise<unknown> { return this.request("POST", "/v1/save-world", {}); }
+  redstone(request: { action: "status" | "configure" | "disable"; speed?: number; workers?: number; budgetMs?: number; optimizeWires?: boolean }): Promise<unknown> {
+    return this.request("POST", "/v2/redstone", request);
+  }
 
   disconnect(): Promise<unknown> {
     return this.request("POST", "/v1/disconnect", {});
@@ -83,37 +76,18 @@ export class MinecraftClient {
     return this.request("POST", "/v1/compare", { operations, ignoreState, maxDifferences });
   }
 
-  apply(operations: FillOperation[], label?: string, projectId?: string, dryRun = false): Promise<unknown> {
-    return this.request("POST", "/v1/apply", { operations, label, projectId, dryRun });
+  project(request: Record<string, unknown>): Promise<unknown> {
+    return this.request("POST", "/v2/projects", request);
   }
 
-  transform(options: TransformOptions): Promise<unknown> {
-    return this.request("POST", "/v1/transform", options);
-  }
+  assembly(request: Record<string, unknown>): Promise<unknown> { return this.request("POST", "/v2/assemblies", request); }
 
-  replace(from: Position, to: Position, match: string[], block: string,
-    label?: string, projectId?: string, dryRun = false): Promise<unknown> {
-    return this.request("POST", "/v1/replace", { from, to, match, block, label, projectId, dryRun });
-  }
+  circuit(request: Record<string, unknown>): Promise<unknown> { return this.request("POST", "/v2/circuits", request); }
+  keyboard(request: Record<string, unknown>): Promise<unknown> { return this.request("POST", "/v2/keyboard", request); }
+  video(request: Record<string, unknown>): Promise<unknown> { return this.request("POST", "/v2/video", request); }
 
-  transactions(): Promise<unknown> {
-    return this.request("GET", "/v1/transactions");
-  }
-
-  startJob(operations: FillOperation[], label?: string, projectId?: string): Promise<unknown> {
-    return this.request("POST", "/v1/jobs", { operations, label, projectId });
-  }
-
-  jobStatus(): Promise<unknown> {
-    return this.request("GET", "/v1/jobs/status");
-  }
-
-  controlJob(action: "pause" | "resume" | "cancel", jobId?: string): Promise<unknown> {
-    return this.request("POST", "/v1/jobs/control", { action, jobId });
-  }
-
-  screenshot(): Promise<ScreenshotResult> {
-    return this.request("POST", "/v1/screenshot", {}) as Promise<ScreenshotResult>;
+  screenshot(includeUI = false): Promise<ScreenshotResult> {
+    return this.request("POST", "/v1/screenshot", { includeUI }) as Promise<ScreenshotResult>;
   }
 
   beginCamera(spectator = true): Promise<unknown> {
@@ -126,14 +100,6 @@ export class MinecraftClient {
 
   restoreCamera(): Promise<unknown> {
     return this.request("POST", "/v1/camera/restore", {});
-  }
-
-  fill(from: Position, to: Position, block: string): Promise<unknown> {
-    return this.request("POST", "/v1/fill", { from, to, block });
-  }
-
-  undo(transactionId?: string, projectId?: string): Promise<unknown> {
-    return this.request("POST", "/v1/undo", { transactionId, projectId });
   }
 
   private async request(method: string, path: string, body?: unknown, authenticate = true): Promise<unknown> {

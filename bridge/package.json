@@ -1,14 +1,17 @@
 {
-  "name": "mcarchitect-mcp",
-  "version": "0.5.0",
+  "name": "mcengineer-mcp",
+  "version": "0.9.1",
   "private": true,
   "type": "module",
-  "bin": { "mcarchitect-mcp": "dist/index.js" },
+  "bin": {
+    "mcengineer-mcp": "dist/index.js"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "workspace": "node dist/workspace-cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

@@ -1,0 +1,59 @@
+{
+  "name": "4-bit bus vectors",
+  "inputs": [
+    "bus.data"
+  ],
+  "probes": [
+    "bus.out"
+  ],
+  "events": [
+    {
+      "tick": 0,
+      "set": {
+        "bus.data": 0
+      }
+    },
+    {
+      "tick": 8,
+      "set": {
+        "bus.data": 5
+      }
+    },
+    {
+      "tick": 16,
+      "set": {
+        "bus.data": 10
+      }
+    },
+    {
+      "tick": 24,
+      "set": {
+        "bus.data": 15
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "tick": 4,
+      "port": "bus.out",
+      "equals": 0
+    },
+    {
+      "tick": 12,
+      "port": "bus.out",
+      "equals": 5
+    },
+    {
+      "tick": 20,
+      "port": "bus.out",
+      "equals": 10
+    },
+    {
+      "tick": 28,
+      "port": "bus.out",
+      "equals": 15
+    }
+  ],
+  "durationTicks": 32,
+  "sampleEveryTicks": 1
+}

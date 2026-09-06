@@ -15,8 +15,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.LightLayer;
-import net.minecraft.world.level.block.Mirror;
-import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -27,10 +25,8 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
-import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -41,31 +37,33 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.HashMap;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
 import java.util.function.Supplier;
 
 final class ArchitectHttpServer {
+    static volatile ArchitectHttpServer instance;
     private static final Gson GSON = new Gson();
     private static final int MAX_BODY_BYTES = 256 * 1024;
     private static final long MAX_BLOCKS = 262_144;
     private static final long MAX_SCAN_COLUMNS = 262_144;
     private static final int MAX_OPERATIONS = 256;
-    private static final int MAX_TRANSACTIONS = 100;
-    private static final int JOB_BLOCKS_PER_TICK = 2_048;
 
     private final ArchitectConfig config;
-    private final ArrayDeque<Transaction> transactions = new ArrayDeque<>();
     private volatile MinecraftServer minecraftServer;
     private CameraSession cameraSession;
-    private BuildingJob buildingJob;
+    private ProjectBuildService projectBuilds;
+    private AssemblyBuildService assemblies;
+    private CircuitTestService circuits;
+    private ComputerKeyboardService keyboard;
+    private final Map<ServerLevel, RedstoneEngine> redstone = new HashMap<>();
+    private FilmEnvironment filmEnvironment;
+    private record FilmEnvironment(ServerLevel level,long day,int clear,int rain,int thunder,boolean raining,boolean thundering) {}
 
     ArchitectHttpServer(ArchitectConfig config) {
         this.config = config;
+        instance = this;
     }
 
     void start() {
@@ -76,24 +74,35 @@ final class ArchitectHttpServer {
             server.createContext("/v1/ui", route("GET", true, this::uiState));
             server.createContext("/v1/worlds", route("GET", true, this::listWorlds));
             server.createContext("/v1/open-world", route("POST", true, this::openWorld));
+            server.createContext("/v1/create-world", route("POST", true, e -> ArchitectClientController.get().createFlatWorld(readBody(e, OpenWorldRequest.class).levelId())));
             server.createContext("/v1/disconnect", route("POST", true, this::disconnect));
+            server.createContext("/v1/save-world", route("POST", true, e -> onServer(() -> {
+                localPlayer(); return Map.of("saved", minecraftServer.saveEverything(true, true, true));
+            })));
             server.createContext("/v1/screenshot", route("POST", true, this::screenshot));
+            server.createContext("/v2/video", route("POST", true, e -> {
+                JsonObject request=readBody(e,JsonObject.class);
+                String action=request.get("action").getAsString();
+                if(action.equals("environment") || action.equals("restore-environment")) return onServer(() -> filmEnvironment(action));
+                return ArchitectClientController.get().video(request);
+            }));
             server.createContext("/v1/camera/begin", route("POST", true, this::beginCamera));
             server.createContext("/v1/camera/move", route("POST", true, this::moveCamera));
             server.createContext("/v1/camera/restore", route("POST", true, this::restoreCamera));
+            server.createContext("/v1/tick-rate", route("POST", true, this::tickRate));
             server.createContext("/v1/context", route("GET", true, this::context));
             server.createContext("/v1/scan", route("POST", true, this::scan));
             server.createContext("/v1/access", route("POST", true, this::validateAccess));
             server.createContext("/v1/compare", route("POST", true, this::compareBlueprint));
-            server.createContext("/v1/apply", route("POST", true, this::apply));
-            server.createContext("/v1/transform", route("POST", true, this::transform));
-            server.createContext("/v1/replace", route("POST", true, this::replace));
-            server.createContext("/v1/fill", route("POST", true, this::fill));
-            server.createContext("/v1/transactions", route("GET", true, this::listTransactions));
-            server.createContext("/v1/undo", route("POST", true, this::undo));
-            server.createContext("/v1/jobs", route("POST", true, this::startJob));
-            server.createContext("/v1/jobs/status", route("GET", true, this::jobStatus));
-            server.createContext("/v1/jobs/control", route("POST", true, this::controlJob));
+            server.createContext("/v2/projects", route("POST", true, this::projectRequest));
+            server.createContext("/v2/assemblies", route("POST", true, e -> engineRequest(e, "assembly")));
+            server.createContext("/v2/circuits", route("POST", true, e -> engineRequest(e, "circuit")));
+            server.createContext("/v2/redstone", route("POST", true, this::redstoneRequest));
+            server.createContext("/v2/keyboard", route("POST", true, e -> {
+                JsonObject request=readBody(e,JsonObject.class);
+                if(request.get("action").getAsString().equals("open")) return ArchitectClientController.get().openKeyboard(request.has("demo") && request.get("demo").getAsBoolean());
+                return onServer(() -> keyboardRequest(request));
+            }));
             server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
             server.start();
             McArchitectMod.LOGGER.info("MC Architect listening on 127.0.0.1:{}", config.port());
@@ -103,56 +112,75 @@ final class ArchitectHttpServer {
     }
 
     void setMinecraftServer(MinecraftServer server) {
+        filmEnvironment=null;
+        redstone.values().forEach(RedstoneEngine::close); redstone.clear();
+        if (assemblies != null) assemblies.close();
+        if (circuits != null) circuits.close();
+        if (projectBuilds != null) projectBuilds.close();
+        projectBuilds = null; assemblies = null; circuits = null; keyboard = null;
         CameraSession abandoned = cameraSession;
         cameraSession = null;
-        if (server == null && abandoned != null) {
-            ArchitectClientController.get().setFov(abandoned.fov);
-        }
+        if (server == null && abandoned != null) ArchitectClientController.get().setFov(abandoned.fov);
         minecraftServer = server;
-        buildingJob = null;
-        synchronized (transactions) {
-            transactions.clear();
+        if (server != null) {
+            Path root = server.getWorldPath(LevelResource.ROOT).resolve("mcarchitect");
+            var store = new ProjectStore(root.resolve("projects"));
+            var world = new MinecraftProjectWorld(server, this::localPlayer);
+            projectBuilds = new ProjectBuildService(store, world);
+            assemblies = new AssemblyBuildService(store, projectBuilds, world);
+            circuits = new CircuitTestService(new MinecraftCircuitWorld(server, this::localPlayer), root.resolve("tests"));
+            keyboard = new ComputerKeyboardService(circuits,server,this::localPlayer,root.resolve("keyboard.json"));
         }
-        if (server != null) loadTransactions(server);
-        if (server != null) loadBuildingJob(server);
     }
 
     void tick(MinecraftServer server) {
-        BuildingJob job = buildingJob;
-        if (job == null || job.status != JobStatus.RUNNING || minecraftServer != server) return;
-        ServerLevel level;
-        try {
-            level = findLevel(job.dimension);
-        } catch (RuntimeException exception) {
-            job.status = JobStatus.PAUSED;
-            job.error = exception.getMessage();
-            saveJobProgress(job);
-            return;
+        if (minecraftServer != server) return;
+        if (projectBuilds != null) projectBuilds.tick();
+        if (assemblies != null) assemblies.tick();
+        boolean sampled = false;
+        for (var entry : redstone.entrySet()) if (entry.getValue().enabled()) {
+            boolean matchingTest = circuits != null && circuits.inDimension(entry.getKey().dimension().identifier().toString());
+            entry.getValue().tick(matchingTest ? circuits::tick : () -> {});
+            sampled |= matchingTest;
         }
-        int end = Math.min(job.blocks.size(), job.progress + JOB_BLOCKS_PER_TICK);
-        try {
-            for (int index = job.progress; index < end; index++) {
-                JobBlock block = job.blocks.get(index);
-                BlockState current = level.getBlockState(block.position());
-                if (current == block.after()) continue;
-                if (current != block.before()) {
-                    throw new ApiException(409, "Job checkpoint conflict at " + block.position().toShortString()
-                            + "; the block changed outside this job");
-                }
-                if (!level.setBlock(block.position(), block.after(), 3)
-                        && level.getBlockState(block.position()) != block.after()) {
-                    throw new ApiException(409, "Minecraft rejected a job change at " + block.position().toShortString());
-                }
+        if (circuits != null && !sampled) circuits.tick();
+        if (keyboard != null) keyboard.tick();
+    }
+
+    private Object filmEnvironment(String action) {
+        ServerLevel level=localPlayer().level();
+        if(action.equals("environment")) {
+            if(filmEnvironment==null) {
+                var data=(net.minecraft.world.level.storage.ServerLevelData)level.getLevelData();
+                filmEnvironment=new FilmEnvironment(level,level.getDayTime(),data.getClearWeatherTime(),data.getRainTime(),data.getThunderTime(),level.isRaining(),level.isThundering());
             }
-            job.progress = end;
-            saveJobProgress(job);
-            if (job.progress == job.blocks.size()) completeBuildingJob(job);
-        } catch (RuntimeException exception) {
-            job.status = JobStatus.PAUSED;
-            job.error = exception.getMessage();
-            saveJobProgress(job);
-            McArchitectMod.LOGGER.error("MC Architect job {} paused after an error", job.id, exception);
+            level.setDayTime(6000);level.setWeatherParameters(12000,0,false,false);
+            return Map.of("presentation",true);
         }
+        if(filmEnvironment!=null) {
+            var saved=filmEnvironment;
+            saved.level.setDayTime(saved.day);
+            saved.level.setWeatherParameters(saved.clear,saved.rain,saved.raining,saved.thundering);
+            ((net.minecraft.world.level.storage.ServerLevelData)saved.level.getLevelData()).setThunderTime(saved.thunder);
+            filmEnvironment=null;
+        }
+        return Map.of("restored",true);
+    }
+
+    private Object keyboardRequest(JsonObject request) {
+        if(keyboard==null) throw new IllegalStateException("请先进入世界");
+        if(request.get("action").getAsString().equals("speed")) {
+            keyboard.requireAvailable();
+            return controlRedstone(localPlayer().level(), "configure", request.get("speed").getAsInt(), Math.min(8,Runtime.getRuntime().availableProcessors()),20,true);
+        }
+        if(!request.get("action").getAsString().equals("status") && (assemblies.ownsWriter() || projectBuilds.ownsWriter())) throw new IllegalStateException("请等待施工结束");
+        return keyboard.request(request);
+    }
+    static CompletableFuture<JsonObject> keyboardFromClient(JsonObject request) {
+        var future=new CompletableFuture<JsonObject>(); var host=instance;
+        if(host==null || host.minecraftServer==null) return CompletableFuture.failedFuture(new IllegalStateException("请先进入单人世界"));
+        host.minecraftServer.execute(()->{ try { future.complete(GSON.toJsonTree(host.keyboardRequest(request)).getAsJsonObject()); } catch(Throwable e) { future.completeExceptionally(e); } });
+        return future;
     }
 
     private HttpHandler route(String method, boolean authenticate, ExchangeAction action) {
@@ -182,11 +210,11 @@ final class ArchitectHttpServer {
         MinecraftServer server = minecraftServer;
         return Map.of(
                 "ok", true,
-                "modVersion", "0.5.0",
+                "modVersion", "0.9.1",
+                "capabilities", List.of("project-stream-v1", "project-journal-recovery", "temporary-chunk-tickets", "project-guards-v1", "assembly-v1", "circuit-test-v1", "redstone-acceleration-v1", "computer-keyboard-v1"),
                 "worldOpen", server != null,
                 "playerAvailable", server != null && !server.getPlayerList().getPlayers().isEmpty(),
                 "limits", Map.of(
-                        "blocksPerTransaction", MAX_BLOCKS,
                         "fullScanBlocks", MAX_BLOCKS,
                         "surfaceScanColumns", MAX_SCAN_COLUMNS,
                         "operationsPerBlueprint", MAX_OPERATIONS
@@ -199,13 +227,51 @@ final class ArchitectHttpServer {
             ServerPlayer player = localPlayer();
             return Map.of(
                     "player", player.getGameProfile().name(),
+                    "worldId", MinecraftProjectWorld.identity(player.level().getServer()),
                     "position", Map.of("x", player.getX(), "y", player.getY(), "z", player.getZ()),
                     "blockPosition", positionJson(player.blockPosition()),
                     "rotation", Map.of("yaw", player.getYRot(), "pitch", player.getXRot()),
                     "dimension", player.level().dimension().identifier().toString(),
-                    "gameMode", player.gameMode.getGameModeForPlayer().getName()
+                    "gameMode", player.gameMode.getGameModeForPlayer().getName(),
+                    "tickRate", minecraftServer.tickRateManager().tickrate()
             );
         });
+    }
+
+    private Object tickRate(HttpExchange exchange) {
+        JsonObject request = readBody(exchange, JsonObject.class);
+        float rate = request.has("rate") ? request.get("rate").getAsFloat() : Float.NaN;
+        if (!Float.isFinite(rate) || rate < 1 || rate > 200) throw new ApiException(400, "Tick rate must be between 1 and 200");
+        return onServer(() -> {
+            localPlayer();
+            minecraftServer.tickRateManager().setTickRate(rate);
+            return Map.of("tickRate", minecraftServer.tickRateManager().tickrate());
+        });
+    }
+
+    private Object redstoneRequest(HttpExchange exchange) {
+        JsonObject request = readBody(exchange, JsonObject.class);
+        return onServer(() -> {
+            ServerLevel level = localPlayer().level();
+            String action = request.has("action") ? request.get("action").getAsString() : "status";
+            int speed = request.has("speed") ? request.get("speed").getAsInt() : 16;
+            int workers = request.has("workers") ? request.get("workers").getAsInt() : Math.min(8, Math.max(1, Runtime.getRuntime().availableProcessors() - 2));
+            double budget = request.has("budgetMs") ? request.get("budgetMs").getAsDouble() : 12;
+            boolean optimize = !request.has("optimizeWires") || request.get("optimizeWires").getAsBoolean();
+            try { return controlRedstone(level, action, speed, workers, budget, optimize); }
+            catch (IllegalArgumentException error) { throw new ApiException(400, error.getMessage()); }
+        });
+    }
+
+    Map<String, Object> controlRedstone(ServerLevel level, String action, int speed, int workers, double budget, boolean optimize) {
+        var engine = redstone.computeIfAbsent(level, RedstoneEngine::new);
+        if (action.equals("status")) return engine.status();
+        if (circuits.ownsWriter()) throw new ApiException(409, "Finish or cancel the active test before changing its clock");
+        if (assemblies.ownsWriter() || projectBuilds.ownsWriter()) throw new ApiException(409, "Pause construction before changing redstone acceleration");
+        if (action.equals("disable")) { engine.disable(); return engine.status(); }
+        if (!action.equals("configure")) throw new IllegalArgumentException("Use status, configure or disable");
+        engine.configure(speed, workers, budget, optimize);
+        return engine.status();
     }
 
     private Object uiState(HttpExchange ignored) {
@@ -226,7 +292,8 @@ final class ArchitectHttpServer {
     }
 
     private Object screenshot(HttpExchange ignored) {
-        return ArchitectClientController.get().captureScreenshot();
+        JsonObject request=readBody(ignored,JsonObject.class);
+        return ArchitectClientController.get().captureScreenshot(request.has("includeUI") && request.get("includeUI").getAsBoolean());
     }
 
     private Object beginCamera(HttpExchange exchange) {
@@ -312,42 +379,6 @@ final class ArchitectHttpServer {
                 "gameMode", player.gameMode().getName(),
                 "fov", fov
         );
-    }
-
-    private Object fill(HttpExchange exchange) {
-        FillRequest request = readBody(exchange, FillRequest.class);
-        if (request.from == null || request.to == null || request.block == null) {
-            throw new ApiException(400, "from, to, and block are required");
-        }
-        return onServer(() -> applyOperations(List.of(request), "fill", null, false));
-    }
-
-    private Object apply(HttpExchange exchange) {
-        ApplyRequest request = readBody(exchange, ApplyRequest.class);
-        if (request.operations == null || request.operations.isEmpty()) {
-            throw new ApiException(400, "operations must contain at least one cuboid");
-        }
-        if (request.operations.size() > MAX_OPERATIONS) {
-            throw new ApiException(400, "Blueprint exceeds the 256 operation limit");
-        }
-        return onServer(() -> applyOperations(request.operations, request.label, request.projectId, request.dryRun));
-    }
-
-    private Object transform(HttpExchange exchange) {
-        TransformRequest request = readBody(exchange, TransformRequest.class);
-        if (request.from == null || request.to == null || request.target == null) {
-            throw new ApiException(400, "from, to, and target are required");
-        }
-        return onServer(() -> transformRegion(request));
-    }
-
-    private Object replace(HttpExchange exchange) {
-        ReplaceRequest request = readBody(exchange, ReplaceRequest.class);
-        if (request.from == null || request.to == null || request.match == null || request.match.isEmpty()
-                || request.block == null) {
-            throw new ApiException(400, "from, to, match, and block are required");
-        }
-        return onServer(() -> replaceRegion(request));
     }
 
     private Object scan(HttpExchange exchange) {
@@ -957,13 +988,6 @@ final class ArchitectHttpServer {
         return Map.of("from", positionJson(bounds.min), "to", positionJson(bounds.max));
     }
 
-    private Object applyOperations(List<FillRequest> operations, String label, String projectId, boolean dryRun) {
-        ServerPlayer player = localPlayer();
-        ServerLevel level = player.level();
-        var desired = desiredFromOperations(level, operations);
-        return applyDesired(level, desired, label, projectId, dryRun, operations.size());
-    }
-
     private LinkedHashMap<BlockPos, BlockState> desiredFromOperations(ServerLevel level, List<FillRequest> operations) {
         var desired = new LinkedHashMap<BlockPos, BlockState>();
         var parsedStates = new HashMap<String, BlockState>();
@@ -988,480 +1012,38 @@ final class ArchitectHttpServer {
         return desired;
     }
 
-    private Object startJob(HttpExchange exchange) {
-        JobRequest request = readBody(exchange, JobRequest.class);
-        if (request.operations == null || request.operations.isEmpty()) {
-            throw new ApiException(400, "operations must contain at least one cuboid");
-        }
-        if (request.operations.size() > MAX_OPERATIONS) {
-            throw new ApiException(400, "Job exceeds the 256 operation limit");
-        }
-        return onServer(() -> createBuildingJob(request));
-    }
+    private Object projectRequest(HttpExchange exchange) { return engineRequest(exchange, "project"); }
 
-    private Object createBuildingJob(JobRequest request) {
-        if (buildingJob != null) throw new ApiException(409, "Another building job is already active");
-        ServerLevel level = localPlayer().level();
-        var desired = desiredFromOperations(level, request.operations);
-        BlueprintAnalysis analysis = analyzeDesired(level, desired);
-        if (!analysis.unloadedChunks.isEmpty()) {
-            throw new ApiException(409, "Job touches " + analysis.unloadedChunks.size()
-                    + " unloaded chunks; first: " + analysis.unloadedChunks.getFirst());
-        }
-        if (!analysis.blockEntities.isEmpty()) {
-            throw new ApiException(409, "Job would overwrite " + analysis.blockEntities.size()
-                    + " block entities; first: " + analysis.blockEntities.getFirst());
-        }
-        if (!analysis.players.isEmpty()) {
-            throw new ApiException(409, "Job collides with players: " + String.join(", ", analysis.players));
-        }
-        if (analysis.before.isEmpty()) return Map.of(
-                "accepted", true, "complete", true, "changedBlocks", 0,
-                "message", "All requested blocks already match");
-        UUID id = UUID.randomUUID();
-        List<JobBlock> blocks = analysis.before.entrySet().stream()
-                .map(entry -> new JobBlock(entry.getKey(), entry.getValue(), desired.get(entry.getKey())))
-                .toList();
-        BuildingJob job = new BuildingJob(id, Instant.now(), level.dimension().identifier().toString(),
-                request.label == null || request.label.isBlank() ? "building job" : request.label,
-                normalizeProjectId(request.projectId), blocks, 0, JobStatus.RUNNING, null,
-                jobPlanFile(level.getServer(), id), jobProgressFile(level.getServer(), id));
-        try {
-            saveJobPlan(job);
-            writeJobProgress(job);
-        } catch (IOException exception) {
-            deleteBuildingJobFiles(job);
-            throw new ApiException(500, "Unable to persist building job checkpoint", exception);
-        }
-        buildingJob = job;
-        return jobStatusResponse(job);
-    }
-
-    private Object jobStatus(HttpExchange ignored) {
-        return onServer(() -> buildingJob == null
-                ? Map.of("active", false)
-                : jobStatusResponse(buildingJob));
-    }
-
-    private Object controlJob(HttpExchange exchange) {
-        JobControlRequest request = readBody(exchange, JobControlRequest.class);
-        return onServer(() -> controlBuildingJob(request));
-    }
-
-    private Object controlBuildingJob(JobControlRequest request) {
-        BuildingJob job = buildingJob;
-        if (job == null) throw new ApiException(409, "There is no active building job");
-        if (request.jobId != null && !job.id.toString().equals(request.jobId)) {
-            throw new ApiException(409, "The requested building job is not active");
-        }
-        return switch (request.action == null ? "" : request.action) {
-            case "pause" -> {
-                job.status = JobStatus.PAUSED;
-                saveJobProgress(job);
-                yield jobStatusResponse(job);
+    private Object engineRequest(HttpExchange exchange, String kind) {
+        JsonObject request = readBody(exchange, JsonObject.class);
+        CompletableFuture<Object> future = onServer(() -> {
+            String action = request.has("action") ? request.get("action").getAsString() : "";
+            boolean starts = Set.of("start", "resume", "rollback", "restore").contains(action);
+            if (starts) {
+                if (!kind.equals("circuit") && redstone.values().stream().anyMatch(RedstoneEngine::enabled)) throw new ApiException(409, "Disable redstone acceleration before construction");
+                if (!kind.equals("circuit") && circuits.ownsWriter()) throw new ApiException(409, "Cancel the active circuit test first");
+                if (kind.equals("circuit") && (assemblies.ownsWriter() || projectBuilds.ownsWriter())) throw new ApiException(409, "Pause construction before testing");
+                if (kind.equals("project") && assemblies.ownsWriter()) throw new ApiException(409, "Control the assembly that owns this project");
             }
-            case "resume" -> {
-                job.status = JobStatus.RUNNING;
-                job.error = null;
-                saveJobProgress(job);
-                yield jobStatusResponse(job);
-            }
-            case "cancel" -> cancelBuildingJob(job);
-            default -> throw new ApiException(400, "action must be one of: pause, resume, cancel");
-        };
-    }
-
-    private Object transformRegion(TransformRequest request) {
-        ServerLevel level = localPlayer().level();
-        Bounds source = bounds(request.from, request.to);
-        validateBounds(level, source);
-        int rotationDegrees = request.rotation == null ? 0 : request.rotation;
-        Rotation rotation = switch (rotationDegrees) {
-            case 0 -> Rotation.NONE;
-            case 90 -> Rotation.CLOCKWISE_90;
-            case 180 -> Rotation.CLOCKWISE_180;
-            case 270 -> Rotation.COUNTERCLOCKWISE_90;
-            default -> throw new ApiException(400, "rotation must be one of: 0, 90, 180, 270");
-        };
-        String mirrorName = request.mirror == null ? "none" : request.mirror;
-        Mirror mirror = switch (mirrorName) {
-            case "none" -> Mirror.NONE;
-            case "x" -> Mirror.FRONT_BACK;
-            case "z" -> Mirror.LEFT_RIGHT;
-            default -> throw new ApiException(400, "mirror must be one of: none, x, z");
-        };
-        int copies = request.copies == null ? 1 : request.copies;
-        if (copies < 1 || copies > 64) throw new ApiException(400, "copies must be between 1 and 64");
-        int spacingX = request.spacing == null ? 0 : request.spacing.x;
-        int spacingY = request.spacing == null ? 0 : request.spacing.y;
-        int spacingZ = request.spacing == null ? 0 : request.spacing.z;
-        boolean includeAir = request.includeAir != null && request.includeAir;
-        int width = source.max.getX() - source.min.getX() + 1;
-        int depth = source.max.getZ() - source.min.getZ() + 1;
-        var desired = new LinkedHashMap<BlockPos, BlockState>();
-
-        for (BlockPos cursor : BlockPos.betweenClosed(source.min, source.max)) {
-            if (!level.hasChunkAt(cursor)) {
-                throw new ApiException(409, "Source touches an unloaded chunk at " + cursor.toShortString());
-            }
-            if (level.getBlockEntity(cursor) != null) {
-                throw new ApiException(409, "Source contains an unsupported block entity at " + cursor.toShortString());
-            }
-            BlockState state = level.getBlockState(cursor);
-            if (!includeAir && state.isAir()) continue;
-            int localX = cursor.getX() - source.min.getX();
-            int localY = cursor.getY() - source.min.getY();
-            int localZ = cursor.getZ() - source.min.getZ();
-            if ("x".equals(mirrorName)) localX = width - 1 - localX;
-            if ("z".equals(mirrorName)) localZ = depth - 1 - localZ;
-            int transformedX;
-            int transformedZ;
-            switch (rotationDegrees) {
-                case 90 -> {
-                    transformedX = depth - 1 - localZ;
-                    transformedZ = localX;
-                }
-                case 180 -> {
-                    transformedX = width - 1 - localX;
-                    transformedZ = depth - 1 - localZ;
-                }
-                case 270 -> {
-                    transformedX = localZ;
-                    transformedZ = width - 1 - localX;
-                }
-                default -> {
-                    transformedX = localX;
-                    transformedZ = localZ;
-                }
-            }
-            BlockState transformedState = state.mirror(mirror).rotate(rotation);
-            for (int copy = 0; copy < copies; copy++) {
-                BlockPos target = new BlockPos(
-                        request.target.x + transformedX + spacingX * copy,
-                        request.target.y + localY + spacingY * copy,
-                        request.target.z + transformedZ + spacingZ * copy
-                );
-                if (target.getY() < level.getMinY() || target.getY() >= level.getMaxY()) {
-                    throw new ApiException(400, "Transformed structure is outside the world's build height");
-                }
-                desired.put(target, transformedState);
-                if (desired.size() > MAX_BLOCKS) {
-                    throw new ApiException(400, "Transformed structure exceeds the 262,144 block limit");
-                }
-            }
+            if (kind.equals("project") && action.equals("pause") && assemblies.ownsWriter()) throw new ApiException(409, "Pause the assembly instead");
+            return switch (kind) {
+                case "assembly" -> assemblies.request(request);
+                case "circuit" -> circuits.request(request);
+                default -> projectBuilds.request(request);
+            };
+        });
+        try { return future.get(60, TimeUnit.SECONDS); }
+        catch (Exception exception) {
+            Throwable cause = exception; while (cause.getCause() != null) cause = cause.getCause();
+            if (cause instanceof IllegalArgumentException) throw new ApiException(400, cause.getMessage());
+            if (cause instanceof IllegalStateException) throw new ApiException(409, cause.getMessage());
+            if (cause instanceof java.nio.file.NoSuchFileException) throw new ApiException(409, "Artifact missing; finish upload or check its ID");
+            throw new ApiException(500, "Engine storage request failed; inspect status before retrying", cause);
         }
-        return applyDesired(level, desired, request.label, request.projectId,
-                request.dryRun, 1);
-    }
-
-    private Object replaceRegion(ReplaceRequest request) {
-        ServerLevel level = localPlayer().level();
-        Bounds region = bounds(request.from, request.to);
-        validateBounds(level, region);
-        BlockState replacement = parseBlockState(request.block);
-        if (replacement.hasBlockEntity()) {
-            throw new ApiException(400, "Block entities are not supported: " + request.block);
-        }
-        Set<String> matches = new HashSet<>(request.match);
-        var desired = new LinkedHashMap<BlockPos, BlockState>();
-        for (BlockPos cursor : BlockPos.betweenClosed(region.min, region.max)) {
-            if (!level.hasChunkAt(cursor)) {
-                throw new ApiException(409, "Replace region touches an unloaded chunk at " + cursor.toShortString());
-            }
-            BlockState current = level.getBlockState(cursor);
-            String state = stateString(current);
-            String block = BuiltInRegistries.BLOCK.getKey(current.getBlock()).toString();
-            if (matches.contains(state) || matches.contains(block)) {
-                desired.put(cursor.immutable(), replacement);
-            }
-        }
-        return applyDesired(level, desired, request.label == null ? "replace blocks" : request.label,
-                request.projectId, request.dryRun, 1);
-    }
-
-    private Object applyDesired(ServerLevel level, LinkedHashMap<BlockPos, BlockState> desired,
-                                String label, String projectId, boolean dryRun, int operationCount) {
-        if (desired.isEmpty()) {
-            return Map.of("dryRun", dryRun, "requestedBlocks", 0, "changedBlocks", 0,
-                    "message", "No blocks matched the request");
-        }
-        BlueprintAnalysis analysis = analyzeDesired(level, desired);
-        if (dryRun) return previewResponse(analysis);
-        if (buildingJob != null) {
-            throw new ApiException(409, "A background building job is active; pause and cancel it before direct edits");
-        }
-        if (!analysis.unloadedChunks.isEmpty()) {
-            throw new ApiException(409, "Operation touches " + analysis.unloadedChunks.size()
-                    + " unloaded chunks; first: " + analysis.unloadedChunks.getFirst());
-        }
-        if (!analysis.blockEntities.isEmpty()) {
-            throw new ApiException(409, "Operation would overwrite " + analysis.blockEntities.size()
-                    + " block entities; first: " + analysis.blockEntities.getFirst());
-        }
-        if (!analysis.players.isEmpty()) {
-            throw new ApiException(409, "Operation collides with players: " + String.join(", ", analysis.players));
-        }
-
-        var before = analysis.before;
-
-        if (before.isEmpty()) {
-            return Map.of("changedBlocks", 0, "message", "All requested blocks already match");
-        }
-
-        var changed = new ArrayList<BlockPos>(before.size());
-        try {
-            for (BlockPos pos : before.keySet()) {
-                BlockState target = desired.get(pos);
-                if (level.getBlockState(pos) == target) {
-                    changed.add(pos);
-                    continue;
-                }
-                if (!level.setBlock(pos, target, 3) && level.getBlockState(pos) != target) {
-                    throw new ApiException(409, "Minecraft rejected a block change at " + pos.toShortString());
-                }
-                changed.add(pos);
-            }
-        } catch (RuntimeException exception) {
-            for (BlockPos pos : changed) level.setBlock(pos, before.get(pos), 3);
-            throw exception;
-        }
-
-        String transactionLabel = label == null || label.isBlank() ? "blueprint" : label;
-        UUID transactionId = UUID.randomUUID();
-        Transaction transaction = new Transaction(
-                transactionId,
-                Instant.now(),
-                level.dimension().identifier().toString(),
-                before,
-                transactionFile(level.getServer(), transactionId),
-                transactionLabel,
-                normalizeProjectId(projectId)
-        );
-        try {
-            saveTransaction(transaction);
-        } catch (IOException exception) {
-            for (BlockPos pos : changed) level.setBlock(pos, before.get(pos), 3);
-            throw new ApiException(500, "Unable to persist undo transaction; changes were rolled back", exception);
-        }
-        synchronized (transactions) {
-            transactions.addLast(transaction);
-            while (transactions.size() > MAX_TRANSACTIONS) deleteTransaction(transactions.removeFirst());
-        }
-
-        var result = new LinkedHashMap<String, Object>();
-        result.put("transactionId", transaction.id.toString());
-        result.put("label", transactionLabel);
-        if (transaction.projectId != null) result.put("projectId", transaction.projectId);
-        result.put("changedBlocks", before.size());
-        result.put("operations", operationCount);
-        return result;
-    }
-
-    private BlueprintAnalysis analyzeDesired(ServerLevel level, LinkedHashMap<BlockPos, BlockState> desired) {
-        var before = new LinkedHashMap<BlockPos, BlockState>();
-        var placeMaterials = new LinkedHashMap<String, Integer>();
-        var overwriteMaterials = new LinkedHashMap<String, Integer>();
-        var unloaded = new java.util.LinkedHashSet<String>();
-        var blockEntities = new ArrayList<String>();
-        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
-        for (var entry : desired.entrySet()) {
-            BlockPos pos = entry.getKey();
-            minX = Math.min(minX, pos.getX());
-            minY = Math.min(minY, pos.getY());
-            minZ = Math.min(minZ, pos.getZ());
-            maxX = Math.max(maxX, pos.getX());
-            maxY = Math.max(maxY, pos.getY());
-            maxZ = Math.max(maxZ, pos.getZ());
-            if (!level.hasChunkAt(pos)) {
-                unloaded.add((pos.getX() >> 4) + "," + (pos.getZ() >> 4));
-                continue;
-            }
-            if (level.getBlockEntity(pos) != null && blockEntities.size() < 64) {
-                blockEntities.add(pos.toShortString());
-            }
-            BlockState current = level.getBlockState(pos);
-            if (current != entry.getValue()) {
-                before.put(pos, current);
-                increment(placeMaterials, stateString(entry.getValue()));
-                increment(overwriteMaterials, stateString(current));
-            }
-        }
-        var players = new ArrayList<String>();
-        for (ServerPlayer player : level.players()) {
-            BlockPos feet = player.blockPosition();
-            if (desired.containsKey(feet) || desired.containsKey(feet.above())) {
-                players.add(player.getGameProfile().name());
-            }
-        }
-        return new BlueprintAnalysis(desired, before,
-                new Bounds(new BlockPos(minX, minY, minZ), new BlockPos(maxX, maxY, maxZ)),
-                placeMaterials, overwriteMaterials, new ArrayList<>(unloaded), blockEntities, players);
-    }
-
-    private static Object previewResponse(BlueprintAnalysis analysis) {
-        var hazards = new LinkedHashMap<String, Object>();
-        hazards.put("unloadedChunks", analysis.unloadedChunks);
-        hazards.put("blockEntities", analysis.blockEntities);
-        hazards.put("players", analysis.players);
-        return Map.of(
-                "dryRun", true,
-                "canApply", analysis.unloadedChunks.isEmpty() && analysis.blockEntities.isEmpty()
-                        && analysis.players.isEmpty(),
-                "bounds", boundsJson(analysis.bounds),
-                "requestedBlocks", analysis.desired.size(),
-                "changedBlocks", analysis.before.size(),
-                "unchangedBlocks", analysis.desired.size() - analysis.before.size(),
-                "placeMaterials", analysis.placeMaterials,
-                "overwriteMaterials", analysis.overwriteMaterials,
-                "hazards", hazards
-        );
     }
 
     private static void increment(Map<String, Integer> counts, String key) {
         counts.merge(key, 1, Integer::sum);
-    }
-
-    private static String normalizeProjectId(String projectId) {
-        if (projectId == null || projectId.isBlank()) return null;
-        if (projectId.length() > 120) throw new ApiException(400, "projectId must be at most 120 characters");
-        return projectId;
-    }
-
-    private static Map<String, Object> jobStatusResponse(BuildingJob job) {
-        var result = new LinkedHashMap<String, Object>();
-        result.put("active", true);
-        result.put("jobId", job.id.toString());
-        result.put("label", job.label);
-        if (job.projectId != null) result.put("projectId", job.projectId);
-        result.put("status", job.status.name().toLowerCase());
-        result.put("completedBlocks", job.progress);
-        result.put("totalBlocks", job.blocks.size());
-        result.put("percent", Math.round((double) job.progress / job.blocks.size() * 10_000.0) / 100.0);
-        result.put("createdAt", job.createdAt.toString());
-        if (job.error != null) result.put("error", job.error);
-        return result;
-    }
-
-    private void completeBuildingJob(BuildingJob job) {
-        var before = new LinkedHashMap<BlockPos, BlockState>();
-        for (JobBlock block : job.blocks) before.put(block.position, block.before);
-        Transaction transaction = new Transaction(job.id, job.createdAt, job.dimension, before,
-                transactionFile(minecraftServer, job.id), job.label, job.projectId);
-        try {
-            saveTransaction(transaction);
-        } catch (IOException exception) {
-            job.status = JobStatus.PAUSED;
-            job.error = "Construction finished but the undo checkpoint could not be finalized";
-            saveJobProgress(job);
-            McArchitectMod.LOGGER.error("Unable to finalize building job {}", job.id, exception);
-            return;
-        }
-        synchronized (transactions) {
-            transactions.addLast(transaction);
-            while (transactions.size() > MAX_TRANSACTIONS) deleteTransaction(transactions.removeFirst());
-        }
-        deleteBuildingJobFiles(job);
-        buildingJob = null;
-    }
-
-    private Object cancelBuildingJob(BuildingJob job) {
-        ServerLevel level = findLevel(job.dimension);
-        int restored = 0;
-        for (int index = job.blocks.size() - 1; index >= 0; index--) {
-            JobBlock block = job.blocks.get(index);
-            if (level.getBlockState(block.position) == block.after) {
-                level.setBlock(block.position, block.before, 3);
-                restored++;
-            }
-        }
-        deleteBuildingJobFiles(job);
-        buildingJob = null;
-        return Map.of("jobId", job.id.toString(), "cancelled", true, "restoredBlocks", restored);
-    }
-
-    private static Path jobDirectory(MinecraftServer server) {
-        return server.getWorldPath(LevelResource.ROOT).resolve("mcarchitect").resolve("jobs");
-    }
-
-    private static Path jobPlanFile(MinecraftServer server, UUID id) {
-        return jobDirectory(server).resolve(id + ".json.gz");
-    }
-
-    private static Path jobProgressFile(MinecraftServer server, UUID id) {
-        return jobDirectory(server).resolve(id + ".progress.json");
-    }
-
-    private static void saveJobPlan(BuildingJob job) throws IOException {
-        Files.createDirectories(job.planFile.getParent());
-        List<PersistedJobBlock> blocks = job.blocks.stream().map(block -> new PersistedJobBlock(
-                block.position.getX(), block.position.getY(), block.position.getZ(),
-                stateString(block.before), stateString(block.after))).toList();
-        PersistedJob plan = new PersistedJob(job.id.toString(), job.createdAt.toEpochMilli(), job.dimension,
-                job.label, job.projectId, blocks);
-        Path temporary = job.planFile.resolveSibling(job.planFile.getFileName() + ".tmp");
-        try (var output = new GZIPOutputStream(Files.newOutputStream(temporary))) {
-            output.write(GSON.toJson(plan).getBytes(StandardCharsets.UTF_8));
-        }
-        Files.move(temporary, job.planFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    }
-
-    private static void writeJobProgress(BuildingJob job) throws IOException {
-        Files.createDirectories(job.progressFile.getParent());
-        PersistedJobProgress progress = new PersistedJobProgress(job.progress,
-                job.status.name().toLowerCase(), job.error);
-        Path temporary = job.progressFile.resolveSibling(job.progressFile.getFileName() + ".tmp");
-        Files.writeString(temporary, GSON.toJson(progress), StandardCharsets.UTF_8);
-        Files.move(temporary, job.progressFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    }
-
-    private static void saveJobProgress(BuildingJob job) {
-        try {
-            writeJobProgress(job);
-        } catch (IOException exception) {
-            McArchitectMod.LOGGER.error("Unable to save building job {} progress", job.id, exception);
-        }
-    }
-
-    private void loadBuildingJob(MinecraftServer server) {
-        Path directory = jobDirectory(server);
-        if (!Files.isDirectory(directory)) return;
-        try (var paths = Files.list(directory)) {
-            Optional<Path> planPath = paths.filter(path -> path.getFileName().toString().endsWith(".json.gz"))
-                    .sorted().findFirst();
-            if (planPath.isEmpty()) return;
-            try (var input = new GZIPInputStream(Files.newInputStream(planPath.get()))) {
-                PersistedJob plan = GSON.fromJson(new String(input.readAllBytes(), StandardCharsets.UTF_8),
-                        PersistedJob.class);
-                UUID id = UUID.fromString(plan.id);
-                Path progressPath = jobProgressFile(server, id);
-                PersistedJobProgress progress = Files.isRegularFile(progressPath)
-                        ? GSON.fromJson(Files.readString(progressPath, StandardCharsets.UTF_8), PersistedJobProgress.class)
-                        : new PersistedJobProgress(0, "paused", "Recovered without a progress file");
-                List<JobBlock> blocks = plan.blocks.stream().map(block -> new JobBlock(
-                        new BlockPos(block.x, block.y, block.z), parseBlockState(block.before),
-                        parseBlockState(block.after))).toList();
-                buildingJob = new BuildingJob(id, Instant.ofEpochMilli(plan.createdAt), plan.dimension,
-                        plan.label, plan.projectId, blocks, Math.max(0, Math.min(progress.progress, blocks.size())),
-                        JobStatus.PAUSED, "Recovered after restart; resume explicitly",
-                        planPath.get(), progressPath);
-                saveJobProgress(buildingJob);
-                McArchitectMod.LOGGER.info("Recovered paused MC Architect building job {}", id);
-            }
-        } catch (Exception exception) {
-            McArchitectMod.LOGGER.error("Unable to recover MC Architect building job", exception);
-        }
-    }
-
-    private static void deleteBuildingJobFiles(BuildingJob job) {
-        try {
-            Files.deleteIfExists(job.planFile);
-            Files.deleteIfExists(job.progressFile);
-        } catch (IOException exception) {
-            McArchitectMod.LOGGER.warn("Unable to delete building job files for {}", job.id, exception);
-        }
     }
 
     private static Bounds bounds(PositionRequest fromRequest, PositionRequest toRequest) {
@@ -1506,7 +1088,7 @@ final class ArchitectHttpServer {
         return (long) max - min + 1L;
     }
 
-    private static BlockState parseBlockState(String specification) {
+    static BlockState parseBlockState(String specification) {
         int propertiesStart = specification.indexOf('[');
         String blockId = propertiesStart < 0 ? specification : specification.substring(0, propertiesStart);
         Identifier id = Identifier.tryParse(blockId);
@@ -1542,7 +1124,7 @@ final class ArchitectHttpServer {
         return (BlockState) state.setValue(property, parsed);
     }
 
-    private static String stateString(BlockState state) {
+    static String stateString(BlockState state) {
         StringBuilder result = new StringBuilder(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
         if (!state.getValues().isEmpty()) {
             result.append('[');
@@ -1563,176 +1145,13 @@ final class ArchitectHttpServer {
         return property.getName(value);
     }
 
-    private Object undo(HttpExchange exchange) {
-        UndoRequest request = readOptionalBody(exchange, UndoRequest.class).orElse(new UndoRequest());
-        return onServer(() -> undoLatest(request.transactionId, request.projectId));
-    }
-
-    private Object listTransactions(HttpExchange ignored) {
-        synchronized (transactions) {
-            var result = new ArrayList<Map<String, Object>>();
-            var iterator = transactions.descendingIterator();
-            while (iterator.hasNext()) {
-                Transaction transaction = iterator.next();
-                var item = new LinkedHashMap<String, Object>();
-                item.put("transactionId", transaction.id.toString());
-                item.put("label", transaction.label);
-                if (transaction.projectId != null) item.put("projectId", transaction.projectId);
-                item.put("createdAt", transaction.createdAt.toString());
-                item.put("dimension", transaction.dimension);
-                item.put("changedBlocks", transaction.before.size());
-                result.add(item);
-            }
-            return Map.of("transactions", result);
-        }
-    }
-
-    private Object undoLatest(String requestedId, String requestedProjectId) {
-        if (buildingJob != null) {
-            throw new ApiException(409, "A background building job is active; cancel or complete it before undo");
-        }
-        if (requestedId != null && requestedProjectId != null) {
-            throw new ApiException(400, "Specify transactionId or projectId, not both");
-        }
-        List<Transaction> selected = new ArrayList<>();
-        synchronized (transactions) {
-            Transaction latest = transactions.peekLast();
-            if (latest == null) {
-                throw new ApiException(409, "There is no transaction to undo");
-            }
-            if (requestedId != null && !latest.id.toString().equals(requestedId)) {
-                throw new ApiException(409, "Only the newest transaction can be undone safely");
-            }
-            if (requestedProjectId != null) {
-                if (!requestedProjectId.equals(latest.projectId)) {
-                    throw new ApiException(409, "Only the newest contiguous project can be undone safely");
-                }
-                var iterator = transactions.descendingIterator();
-                while (iterator.hasNext()) {
-                    Transaction transaction = iterator.next();
-                    if (!requestedProjectId.equals(transaction.projectId)) break;
-                    selected.add(transaction);
-                }
-            } else {
-                selected.add(latest);
-            }
-        }
-
-        var rollback = new ArrayList<UndoChange>();
-        int restoredBlocks = 0;
-        try {
-            for (Transaction transaction : selected) {
-                ServerLevel level = findLevel(transaction.dimension);
-                for (var entry : transaction.before.entrySet()) {
-                    BlockState current = level.getBlockState(entry.getKey());
-                    if (current == entry.getValue()) continue;
-                    if (!level.setBlock(entry.getKey(), entry.getValue(), 3)
-                            && level.getBlockState(entry.getKey()) != entry.getValue()) {
-                        throw new ApiException(409, "Minecraft rejected an undo change at "
-                                + entry.getKey().toShortString());
-                    }
-                    rollback.add(new UndoChange(level, entry.getKey(), current));
-                    restoredBlocks++;
-                }
-            }
-        } catch (RuntimeException exception) {
-            for (int index = rollback.size() - 1; index >= 0; index--) {
-                UndoChange change = rollback.get(index);
-                change.level.setBlock(change.position, change.state, 3);
-            }
-            throw exception;
-        }
-        synchronized (transactions) {
-            for (Transaction transaction : selected) {
-                if (transactions.peekLast() != transaction) {
-                    throw new ApiException(409, "Transaction stack changed while undo was running");
-                }
-                transactions.removeLast();
-            }
-        }
-        selected.forEach(ArchitectHttpServer::deleteTransaction);
-        var result = new LinkedHashMap<String, Object>();
-        result.put("transactionId", selected.getFirst().id.toString());
-        if (requestedProjectId != null) result.put("projectId", requestedProjectId);
-        result.put("transactionsUndone", selected.size());
-        result.put("restoredBlocks", restoredBlocks);
-        return result;
-    }
-
     private ServerLevel findLevel(String dimension) {
         MinecraftServer server = minecraftServer;
         if (server == null) throw new ApiException(409, "No single-player world is open");
         for (ServerLevel level : server.getAllLevels()) {
             if (level.dimension().identifier().toString().equals(dimension)) return level;
         }
-        throw new ApiException(409, "Transaction dimension is not available: " + dimension);
-    }
-
-    private static Path transactionFile(MinecraftServer server, UUID id) {
-        return server.getWorldPath(LevelResource.ROOT)
-                .resolve("mcarchitect").resolve("transactions").resolve(id + ".json.gz");
-    }
-
-    private static void saveTransaction(Transaction transaction) throws IOException {
-        Files.createDirectories(transaction.file.getParent());
-        List<PersistedBlock> blocks = transaction.before.entrySet().stream()
-                .map(entry -> new PersistedBlock(
-                        entry.getKey().getX(), entry.getKey().getY(), entry.getKey().getZ(), stateString(entry.getValue())))
-                .toList();
-        PersistedTransaction persisted = new PersistedTransaction(
-                transaction.id.toString(), transaction.createdAt.toEpochMilli(), transaction.dimension,
-                transaction.label, transaction.projectId, blocks
-        );
-        Path temporary = transaction.file.resolveSibling(transaction.file.getFileName() + ".tmp");
-        try (var output = new GZIPOutputStream(Files.newOutputStream(temporary))) {
-            output.write(GSON.toJson(persisted).getBytes(StandardCharsets.UTF_8));
-        }
-        Files.move(temporary, transaction.file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    }
-
-    private void loadTransactions(MinecraftServer server) {
-        Path directory = server.getWorldPath(LevelResource.ROOT).resolve("mcarchitect").resolve("transactions");
-        if (!Files.isDirectory(directory)) return;
-        try (var paths = Files.list(directory)) {
-            List<Transaction> loaded = paths.filter(path -> path.getFileName().toString().endsWith(".json.gz"))
-                    .map(path -> loadTransaction(path, server))
-                    .flatMap(Optional::stream)
-                    .sorted(Comparator.comparing(Transaction::createdAt))
-                    .toList();
-            synchronized (transactions) {
-                for (Transaction transaction : loaded) transactions.addLast(transaction);
-                while (transactions.size() > MAX_TRANSACTIONS) deleteTransaction(transactions.removeFirst());
-            }
-            McArchitectMod.LOGGER.info("Loaded {} persistent MC Architect undo transactions", transactions.size());
-        } catch (IOException exception) {
-            McArchitectMod.LOGGER.error("Unable to load persistent MC Architect transactions", exception);
-        }
-    }
-
-    private static Optional<Transaction> loadTransaction(Path path, MinecraftServer server) {
-        try (var input = new GZIPInputStream(Files.newInputStream(path))) {
-            PersistedTransaction persisted = GSON.fromJson(
-                    new String(input.readAllBytes(), StandardCharsets.UTF_8), PersistedTransaction.class);
-            UUID id = UUID.fromString(persisted.id);
-            var before = new LinkedHashMap<BlockPos, BlockState>();
-            for (PersistedBlock block : persisted.before) {
-                before.put(new BlockPos(block.x, block.y, block.z), parseBlockState(block.state));
-            }
-            return Optional.of(new Transaction(id, Instant.ofEpochMilli(persisted.createdAt),
-                    persisted.dimension, before, path, persisted.label, persisted.projectId));
-        } catch (Exception exception) {
-            McArchitectMod.LOGGER.error("Ignoring invalid transaction file {}", path, exception);
-            return Optional.empty();
-        }
-    }
-
-    private static void deleteTransaction(Transaction transaction) {
-        try {
-            Files.deleteIfExists(transaction.file);
-        } catch (IOException exception) {
-            McArchitectMod.LOGGER.warn("Unable to delete transaction file {}", transaction.file, exception);
-        }
+        throw new ApiException(409, "Camera dimension is not available: " + dimension);
     }
 
     private ServerPlayer localPlayer() {
@@ -1830,25 +1249,10 @@ final class ArchitectHttpServer {
         Object run(HttpExchange exchange);
     }
 
-    private record Transaction(UUID id, Instant createdAt, String dimension, Map<BlockPos, BlockState> before,
-                               Path file, String label, String projectId) {}
-
-    private record PersistedTransaction(String id, long createdAt, String dimension, String label,
-                                        String projectId, List<PersistedBlock> before) {}
-
-    private record PersistedBlock(int x, int y, int z, String state) {}
-
     private static final class FillRequest {
         PositionRequest from;
         PositionRequest to;
         String block;
-    }
-
-    private static final class ApplyRequest {
-        List<FillRequest> operations;
-        String label;
-        String projectId;
-        boolean dryRun;
     }
 
     private static final class CompareRequest {
@@ -1868,37 +1272,6 @@ final class ArchitectHttpServer {
         Integer maxVisited;
     }
 
-    private static final class TransformRequest extends RegionRequest {
-        PositionRequest target;
-        Integer rotation;
-        String mirror;
-        Integer copies;
-        PositionRequest spacing;
-        Boolean includeAir;
-        String label;
-        String projectId;
-        boolean dryRun;
-    }
-
-    private static final class ReplaceRequest extends RegionRequest {
-        List<String> match;
-        String block;
-        String label;
-        String projectId;
-        boolean dryRun;
-    }
-
-    private static final class JobRequest {
-        List<FillRequest> operations;
-        String label;
-        String projectId;
-    }
-
-    private static final class JobControlRequest {
-        String jobId;
-        String action;
-    }
-
     private static class RegionRequest {
         PositionRequest from;
         PositionRequest to;
@@ -1913,11 +1286,6 @@ final class ArchitectHttpServer {
         BlockPos toBlockPos() {
             return new BlockPos(x, y, z);
         }
-    }
-
-    private static final class UndoRequest {
-        String transactionId;
-        String projectId;
     }
 
     private record OpenWorldRequest(String levelId) {}
@@ -1943,56 +1311,6 @@ final class ArchitectHttpServer {
 
     private record SurfaceScan(Bounds bounds, int width, int depth, int[] heights, String[] states,
                                TerrainKind[] kinds) {}
-
-    private record BlueprintAnalysis(LinkedHashMap<BlockPos, BlockState> desired,
-                                     LinkedHashMap<BlockPos, BlockState> before, Bounds bounds,
-                                     Map<String, Integer> placeMaterials,
-                                     Map<String, Integer> overwriteMaterials,
-                                     List<String> unloadedChunks, List<String> blockEntities,
-                                     List<String> players) {}
-
-    private record UndoChange(ServerLevel level, BlockPos position, BlockState state) {}
-
-    private record JobBlock(BlockPos position, BlockState before, BlockState after) {}
-
-    private record PersistedJob(String id, long createdAt, String dimension, String label,
-                                String projectId, List<PersistedJobBlock> blocks) {}
-
-    private record PersistedJobBlock(int x, int y, int z, String before, String after) {}
-
-    private record PersistedJobProgress(int progress, String status, String error) {}
-
-    private enum JobStatus { RUNNING, PAUSED }
-
-    private static final class BuildingJob {
-        final UUID id;
-        final Instant createdAt;
-        final String dimension;
-        final String label;
-        final String projectId;
-        final List<JobBlock> blocks;
-        int progress;
-        JobStatus status;
-        String error;
-        final Path planFile;
-        final Path progressFile;
-
-        BuildingJob(UUID id, Instant createdAt, String dimension, String label, String projectId,
-                    List<JobBlock> blocks, int progress, JobStatus status, String error,
-                    Path planFile, Path progressFile) {
-            this.id = id;
-            this.createdAt = createdAt;
-            this.dimension = dimension;
-            this.label = label;
-            this.projectId = projectId;
-            this.blocks = blocks;
-            this.progress = progress;
-            this.status = status;
-            this.error = error;
-            this.planFile = planFile;
-            this.progressFile = progressFile;
-        }
-    }
 
     private record CameraSession(String dimension, double x, double y, double z, float yaw, float pitch,
                                  GameType gameMode, int fov) {}

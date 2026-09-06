@@ -39,4 +39,3 @@ public record ArchitectConfig(int port, String token) {
         }
     }
 }
-

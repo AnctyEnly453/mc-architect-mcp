@@ -18,3 +18,14 @@ Thumbs.db
 mcarchitect.json
 .env
 .env.*
+
+# Local projects, captures, and release staging
+artifacts/
+output/
+recordings/
+screenshots/
+saves/
+.refactor-backup/
+.playwright-cli/
+.playwright-mcp/
+*.jfr
