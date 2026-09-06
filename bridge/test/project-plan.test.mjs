@@ -3,8 +3,17 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { indexSections, rasterizeSection, prepareProject, readPreparedProject, sectionFile } from "../dist/project-plan.js";
 import { uploadProject } from "../dist/project-transfer.js";
+
+test("checked-in cross-language fixtures can be uploaded without changing their byte hashes", async () => {
+  const directory = fileURLToPath(new URL("./fixtures/prepared-project/", import.meta.url));
+  const requests = [];
+  const result = await uploadProject(directory, { async project(request) { requests.push(request); } });
+  assert.equal(result.uploaded, 2);
+  assert.equal(requests.filter(request => request.action === "upload").length, 2);
+});
 
 function decode(section) {
   const cells = [];

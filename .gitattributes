@@ -2,3 +2,5 @@
 *.bat text eol=crlf
 *.jar binary
 *.png binary
+# Protocol fixtures are hashed as exact UTF-8 bytes, including EOF.
+bridge/test/fixtures/prepared-project/sections/*.json -text
